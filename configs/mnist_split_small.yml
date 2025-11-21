@@ -1,0 +1,41 @@
+experiment_name: "mnist_split_sparse_snn"
+
+seed: 42
+device: "cpu" #"cuda"   # or "cpu"
+
+data:
+  root: "./data"
+  batch_size: 64
+  num_workers: 4
+  # split into 2 tasks: digits 0–4 and 5–9
+  splits:
+    - [0, 1, 2, 3, 4]
+    - [5, 6, 7, 8, 9]
+
+model:
+  input_size: 784
+  hidden_size: 2048      # was 512; more capacity → more room for sparsity
+  output_size: 10
+  time_steps: 10
+  v_th: 1.0
+
+train:
+  epochs_per_task: 3
+  lr: 0.001
+  usage_decay: 0.99
+  usage_alpha: 10.0
+
+  do_consolidation: true
+  consolidation_epochs: 2
+  max_consolidation_batches: 100   # optional
+
+  replay_buffer_size: 4000         # <--- add this back
+
+  lambda_spike: 0.0005
+  lambda_weight: 0.00005
+  lambda_usage_weight: 10.0
+  prune_threshold: 0.0005
+
+  # NEW: stability/distillation on Task 1 during Task 2 training
+  lambda_stab: 0.25          # you can tune this
+  stability_buffer_size: 2000

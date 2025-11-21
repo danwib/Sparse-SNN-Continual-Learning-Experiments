@@ -1,0 +1,310 @@
+# src/usage_sparse_snn_cl/training/train_sequence.py
+from __future__ import annotations
+from typing import Dict, Any, List, Tuple
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+
+from usage_sparse_snn_cl.training.usage_tracker import UsageTracker, UsageConfig
+from usage_sparse_snn_cl.training.replay_buffer import ReplayBuffer
+from usage_sparse_snn_cl.data.mnist_split import flatten_and_normalise
+from usage_sparse_snn_cl.training.replay_buffer import ReplayBuffer
+
+
+import copy
+import torch.nn.functional as F
+
+
+
+def weight_sparsity(model: nn.Module) -> float:
+    """
+    Returns fraction of weights that are exactly zero.
+    """
+    total = 0
+    nonzero = 0
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        data = p.detach()
+        total += data.numel()
+        nonzero += (data != 0).sum().item()
+    if total == 0:
+        return 0.0
+    return 1.0 - nonzero / total
+
+
+def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    preds = logits.argmax(dim=1)
+    return (preds == targets).float().mean().item()
+
+
+def train_single_task(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    usage_tracker: UsageTracker,
+    train_loader: DataLoader,
+    replay_buffer: ReplayBuffer | None,
+    device: torch.device,
+    epochs: int,
+    is_acquisition: bool,
+    lambda_spike: float = 0.0,
+    lambda_weight: float = 0.0,
+    lambda_usage_weight: float = 0.0,
+    # NEW: stability / distillation on previous tasks
+    stability_buffer: ReplayBuffer | None = None,
+    teacher_model: nn.Module | None = None,
+    lambda_stab: float = 0.0,
+) -> None:
+
+    model.train()
+    ce = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        for x, y in train_loader:
+            x = flatten_and_normalise(x).to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad()
+            logits, aux = model(x)
+
+            loss = ce(logits, y)
+            # spike sparsity: encourage low average hidden spike rate
+            if lambda_spike > 0.0 and "hidden_spike_rate" in aux:
+                spike_rate = aux["hidden_spike_rate"]
+                loss = loss + lambda_spike * spike_rate.mean()
+
+            # Stability / distillation loss on previous tasks (Design 1)
+            if (
+                is_acquisition
+                and stability_buffer is not None
+                and teacher_model is not None
+                and lambda_stab > 0.0
+            ):
+                # Sample a batch of Task-1 inputs
+                x_old, _ = stability_buffer.sample(train_loader.batch_size)
+                x_old = x_old.to(device)
+
+                with torch.no_grad():
+                    teacher_logits, _ = teacher_model(x_old)
+
+                student_logits, _ = model(x_old)
+                stab_loss = F.mse_loss(student_logits, teacher_logits)
+                loss = loss + lambda_stab * stab_loss
+
+
+            loss.backward()
+
+            # update usage from grads
+            usage_tracker.update_from_grads()
+
+            if is_acquisition:
+                # scale grads so low-usage params learn faster
+                usage_tracker.scale_grads_for_new_task()
+            else:
+                # consolidation: add usage-weighted L1 penalty via manual grad
+                if lambda_weight > 0.0:
+                    reg = usage_tracker.usage_weighted_l1(lambda_weight, lambda_usage_weight)
+                    reg.backward()
+
+            optimizer.step()
+
+            if replay_buffer is not None and is_acquisition:
+                replay_buffer.add_batch(x, y)
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+    """
+    Returns (accuracy, mean_hidden_spike_rate).
+    """
+    model.eval()
+    accs: List[float] = []
+    spike_means: List[float] = []
+
+    for x, y in loader:
+        x = flatten_and_normalise(x).to(device)
+        y = y.to(device)
+        logits, aux = model(x)
+        accs.append(accuracy(logits, y))
+
+        if "hidden_spike_rate" in aux:
+            spike_means.append(aux["hidden_spike_rate"].mean().item())
+
+    mean_acc = sum(accs) / len(accs)
+    mean_spike = sum(spike_means) / len(spike_means) if spike_means else 0.0
+    return mean_acc, mean_spike
+
+
+
+def train_task_sequence(
+    model: nn.Module,
+    task_loaders: List[Tuple[DataLoader, DataLoader]],
+    cfg: Dict[str, Any],
+    device: torch.device,
+) -> None:
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=cfg["train"]["lr"])
+
+    usage_cfg = UsageConfig(
+        decay=cfg["train"]["usage_decay"],
+        alpha=cfg["train"]["usage_alpha"],
+    )
+    usage_tracker = UsageTracker(model=model, config=usage_cfg)
+
+    replay_buffer = ReplayBuffer(cfg["train"]["replay_buffer_size"]) \
+        if cfg["train"]["do_consolidation"] else None
+
+    teacher_model = None
+    stability_buffer = None
+
+    num_tasks = len(task_loaders)
+    for task_id, (train_loader, test_loader) in enumerate(task_loaders):
+        print(f"\n=== Task {task_id+1}/{num_tasks} ===")
+
+        # 1) Acquisition on new task
+        # For Task 1: stability_buffer/teacher_model are None → no stability term.
+        # For Task 2+: they are set → Design 1 distillation is active.
+        lambda_stab = float(cfg["train"].get("lambda_stab", 0.0))
+
+        train_single_task(
+            model=model,
+            optimizer=optimizer,
+            usage_tracker=usage_tracker,
+            train_loader=train_loader,
+            replay_buffer=replay_buffer,
+            device=device,
+            epochs=cfg["train"]["epochs_per_task"],
+            is_acquisition=True,
+            stability_buffer=stability_buffer,
+            teacher_model=teacher_model,
+            lambda_stab=lambda_stab,
+        )
+
+        # eval on all tasks so far (simple CL metric)
+        for eval_id in range(task_id + 1):
+            _, eval_loader = task_loaders[eval_id]
+            acc, mean_spike = evaluate(model, eval_loader, device)
+            print(
+                f"  pre-consol eval on task {eval_id+1}: "
+                f"acc={acc:.3f}, mean_hidden_spike_rate={mean_spike:.4f}"
+            )
+
+
+
+         # 2) Consolidation phase (optional)
+        if cfg["train"]["do_consolidation"] and replay_buffer is not None and len(replay_buffer) > 0:
+            print("  consolidation...")
+
+            lambda_spike_base = float(cfg["train"]["lambda_spike"])
+            lambda_weight_base = float(cfg["train"]["lambda_weight"])
+            lambda_usage_weight = float(cfg["train"]["lambda_usage_weight"])
+
+            ce = nn.CrossEntropyLoss()
+            num_consol_epochs = cfg["train"]["consolidation_epochs"]
+
+            for epoch in range(num_consol_epochs):
+                # frac goes 0 → 1 across consolidation epochs
+                frac = epoch / max(num_consol_epochs - 1, 1)
+
+                # Two-stage behaviour:
+                #   early epochs: sparsity_scale ≈ 1 (strong sparsity)
+                #   late  epochs: sparsity_scale ≈ 0 (almost pure CE)
+                sparsity_scale = 1.0 - frac
+                print(
+                    f"  consolidation epoch {epoch+1}/{num_consol_epochs} "
+                    f"(sparsity_scale={sparsity_scale:.3f})"
+                )
+
+                # how many batches of replay per epoch
+                num_batches = len(train_loader)
+                max_consol_batches = cfg["train"].get("max_consolidation_batches")
+                if max_consol_batches is not None:
+                    num_batches = min(num_batches, max_consol_batches)
+
+                for step in range(num_batches):
+                    x_rep, y_rep = replay_buffer.sample(cfg["data"]["batch_size"])
+                    x_rep = x_rep.to(device)
+                    y_rep = y_rep.to(device)
+
+                    optimizer.zero_grad()
+
+                    logits, aux = model(x_rep)
+
+                    # 1) task loss on replay (always active)
+                    loss = ce(logits, y_rep)
+
+                    # 2) spike sparsity – scaled by sparsity_scale
+                    if (
+                        "hidden_spike_rate" in aux
+                        and lambda_spike_base > 0.0
+                        and sparsity_scale > 0.0
+                    ):
+                        spike_rate = aux["hidden_spike_rate"]
+                        loss = loss + (sparsity_scale * lambda_spike_base) * spike_rate.mean()
+
+                    # 3) usage-weighted L1 – scaled by sparsity_scale
+                    if lambda_weight_base > 0.0 and sparsity_scale > 0.0:
+                        reg = usage_tracker.usage_weighted_l1(
+                            sparsity_scale * lambda_weight_base,
+                            lambda_usage_weight,
+                        )
+                        loss = loss + reg
+
+                    # single backward pass for CE + sparsity
+                    loss.backward()
+
+                    # update usage stats from current grads
+                    usage_tracker.update_from_grads()
+
+                    optimizer.step()
+
+                    # optional progress print every N steps
+                    if (step + 1) % 50 == 0:
+                        print(
+                            f"    consol step {step+1}/{num_batches}, "
+                            f"loss={loss.item():.3f}"
+                        )
+
+
+        # 2b) Evaluate again after consolidation to see its effect
+        print("  post-consol evals:")
+        for eval_id in range(task_id + 1):
+            _, eval_loader = task_loaders[eval_id]
+            acc_post, mean_spike_post = evaluate(model, eval_loader, device)
+            print(
+                f"    task {eval_id+1}: "
+                f"acc={acc_post:.3f}, mean_hidden_spike_rate={mean_spike_post:.4f}"
+            )
+
+
+        # 3) Prune to restore sparsity
+        usage_tracker.prune_small(cfg["train"]["prune_threshold"])
+
+        # 4) Report some stats
+        w_sparsity = weight_sparsity(model)
+        usage_stats = usage_tracker.summary()
+        print(
+            f"  stats after task {task_id+1}: "
+            f"weight_sparsity={w_sparsity:.3f}, "
+            f"usage_mean={usage_stats['usage_mean']:.5f}, "
+            f"usage_max={usage_stats['usage_max']:.5f}"
+        )
+
+        # 5) After Task 1, snapshot a teacher + build stability buffer for Task 1
+        if task_id == 0:
+            print("  creating teacher snapshot and stability buffer for Task 1...")
+            # Teacher: deep copy of current model, frozen
+            teacher_model = copy.deepcopy(model).to(device)
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad = False
+
+            
+            stab_buf_size = cfg["train"].get("stability_buffer_size", 2000)
+            stability_buffer = ReplayBuffer(stab_buf_size)
+
+            task1_train_loader, _ = task_loaders[0]  # (train_loader, test_loader)
+            for x_batch, y_batch in task1_train_loader:
+                x_flat = flatten_and_normalise(x_batch)
+                stability_buffer.add_batch(x_flat, y_batch)
+            print(f"  stability buffer filled with {len(stability_buffer)} Task-1 batches")
