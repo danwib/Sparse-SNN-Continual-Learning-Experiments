@@ -24,8 +24,8 @@ train:
   usage_decay: 0.99
   usage_alpha: 10.0
 
-  do_consolidation: true
-  consolidation_epochs: 1
+  do_consolidation: false
+  consolidation_epochs: 0
   replay_buffer_size: 2000
 
   lambda_spike: 0.0005
@@ -33,7 +33,7 @@ train:
   lambda_usage_weight: 10.0
   prune_threshold: 0.0005
   max_batches_per_epoch: 20
-  max_consolidation_batches: 10
+  max_consolidation_batches: 0
   truncate_window: 5
 
   lambda_stab: 0.25
