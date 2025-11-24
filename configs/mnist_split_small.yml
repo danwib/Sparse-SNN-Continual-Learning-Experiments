@@ -14,9 +14,9 @@ data:
 
 model:
   input_size: 784
-  hidden_size: 2048      # was 512; more capacity → more room for sparsity
+  hidden_size: 512      # was 512; more capacity → more room for sparsity
   output_size: 10
-  time_steps: 10
+  time_steps: 5
   v_th: 1.0
 
 train:
