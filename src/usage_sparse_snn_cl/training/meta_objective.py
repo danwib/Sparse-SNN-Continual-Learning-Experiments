@@ -14,7 +14,7 @@ class MetaObjectiveConfig:
 
     stability_weight: float = 0.5
     plasticity_weight: float = 0.5
-    mid_plasticity_weight: float = 0.2
+    mid_plasticity_weight: float = 0.4
 
 
 def stability_plasticity_objective(
@@ -33,19 +33,17 @@ def stability_plasticity_objective(
     stability_loss = final_eval[0]["loss"]
     plasticity_loss = final_eval[-1]["loss"]
 
-    mid_loss = None
-    mid_entries = episode_metrics.get("mid_eval", [])
-    if mid_entries:
-        target_task = len(final_eval)
-        for entry in mid_entries:
-            if entry["task"] == target_task:
-                mid_loss = entry["loss"]
-                break
+    mid_entries = [
+        entry
+        for entry in episode_metrics.get("mid_eval", [])
+        if entry["task"] == len(final_eval)
+    ]
 
     score = -(
         config.stability_weight * stability_loss
         + config.plasticity_weight * plasticity_loss
     )
-    if mid_loss is not None and config.mid_plasticity_weight > 0.0:
-        score = score - config.mid_plasticity_weight * mid_loss
+    if mid_entries and config.mid_plasticity_weight > 0.0:
+        mid_mean = sum(entry["loss"] for entry in mid_entries) / len(mid_entries)
+        score = score - config.mid_plasticity_weight * mid_mean
     return score

@@ -91,6 +91,12 @@ def functional_train_task_sequence(
     truncate_window = cfg["train"].get("truncate_window")
     steps_since_trunc = 0
     mid_eval_batches = cfg["train"].get("mid_eval_batches")
+    if isinstance(mid_eval_batches, int):
+        mid_eval_points = [mid_eval_batches]
+    elif isinstance(mid_eval_batches, list):
+        mid_eval_points = sorted(int(v) for v in mid_eval_batches)
+    else:
+        mid_eval_points = []
 
     teacher_params = None
     stability_batcher = None
@@ -102,7 +108,7 @@ def functional_train_task_sequence(
     for task_id, (train_loader, test_loader) in enumerate(task_loaders):
         print(f"[functional] task {task_id+1}/{len(task_loaders)}")
 
-        mid_recorded = False
+        recorded_mid_points = set()
         for epoch in range(cfg["train"]["epochs_per_task"]):
             batch_iter = iter(train_loader)
             batch_count = 0
@@ -202,21 +208,23 @@ def functional_train_task_sequence(
                 if replay_buffer is not None:
                     replay_buffer.add_batch(x.detach(), y.detach())
 
-                if (
-                    not mid_recorded
-                    and mid_eval_batches is not None
-                    and batch_count >= mid_eval_batches
-                ):
-                    mid_recorded = True
-                    x_mid, y_mid = next(iter(test_loader))
-                    x_mid = flatten_and_normalise(x_mid).to(device)
-                    y_mid = y_mid.to(device)
-                    logits_mid, _ = _functional_forward(model, params, x_mid)
-                    loss_mid = F.cross_entropy(logits_mid, y_mid)
-                    acc_mid = (logits_mid.argmax(dim=1) == y_mid).float().mean()
-                    mid_eval.append(
-                        {"task": task_id + 1, "loss": loss_mid, "acc": acc_mid}
-                    )
+                for point in mid_eval_points:
+                    if batch_count >= point and point not in recorded_mid_points:
+                        recorded_mid_points.add(point)
+                        x_mid, y_mid = next(iter(test_loader))
+                        x_mid = flatten_and_normalise(x_mid).to(device)
+                        y_mid = y_mid.to(device)
+                        logits_mid, _ = _functional_forward(model, params, x_mid)
+                        loss_mid = F.cross_entropy(logits_mid, y_mid)
+                        acc_mid = (logits_mid.argmax(dim=1) == y_mid).float().mean()
+                        mid_eval.append(
+                            {
+                                "task": task_id + 1,
+                                "loss": loss_mid,
+                                "acc": acc_mid,
+                                "batches": point,
+                            }
+                        )
 
         # After acquisition, optional consolidation (non-differentiable)
         if replay_buffer is not None and len(replay_buffer) > 0:

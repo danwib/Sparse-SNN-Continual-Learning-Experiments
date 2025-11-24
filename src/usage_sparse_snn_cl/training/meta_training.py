@@ -155,10 +155,9 @@ def meta_train_controller(
         if "mid_eval" in episode_metrics and episode_metrics["mid_eval"]:
             target_task = len(episode_metrics["final_eval"])
             mids = [m for m in episode_metrics["mid_eval"] if m["task"] == target_task]
-            if mids:
-                mid = mids[-1]
+            for mid in mids:
                 print(
-                    f"[meta] mid_task{mid['task']}_loss={mid['loss'].item():.4f}, "
+                    f"[meta] mid_task{mid['task']}_b{mid['batches']}_loss={mid['loss'].item():.4f}, "
                     f"mid_acc={mid['acc'].item():.3f}"
                 )
 

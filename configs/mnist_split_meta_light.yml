@@ -35,7 +35,7 @@ train:
   max_batches_per_epoch: 20
   max_consolidation_batches: 0
   truncate_window: 5
-  mid_eval_batches: 5
+  mid_eval_batches: [5, 10]
 
   lambda_stab: 0.25
   stability_buffer_size: 2000
