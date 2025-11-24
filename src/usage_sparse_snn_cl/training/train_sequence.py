@@ -178,7 +178,7 @@ def train_single_task(
 
             if is_acquisition:
                 if controller is not None and feature_tracker is not None:
-                    gates = controller(feature_tracker.get_feature_matrix())
+                    gates, _ = controller(feature_tracker.get_feature_matrix())
                     apply_neuron_gates(model, gates)
                 # scale grads so low-usage params learn faster
                 usage_tracker.scale_grads_for_new_task()
