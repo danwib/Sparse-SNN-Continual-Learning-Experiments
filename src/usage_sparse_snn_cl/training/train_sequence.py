@@ -117,6 +117,7 @@ def train_single_task(
 
             stability_term = None
             stab_loss = None
+            stability_control = None
             # Stability / distillation loss on previous tasks (Design 1)
             if (
                 is_acquisition
@@ -132,8 +133,13 @@ def train_single_task(
                     teacher_logits, _ = teacher_model(x_old)
 
                 student_logits, _ = model(x_old)
+                if controller is not None and feature_tracker is not None:
+                    _, stability_control = controller(feature_tracker.get_feature_matrix())
+                    stab_scale = stability_control.mean()
+                else:
+                    stab_scale = 1.0
                 stab_loss = F.mse_loss(student_logits, teacher_logits)
-                stability_term = lambda_stab * stab_loss
+                stability_term = lambda_stab * stab_scale * stab_loss
 
             total_loss = loss_task
             if stability_term is not None:

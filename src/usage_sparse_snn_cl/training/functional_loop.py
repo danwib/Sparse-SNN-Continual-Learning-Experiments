@@ -123,6 +123,7 @@ def functional_train_task_sequence(
                     feature_tracker.update_spike_rates(spike_rate.detach())
 
                 stability_term = None
+                stability_control = None
                 if (
                     lambda_stab > 0.0
                     and teacher_params is not None
@@ -133,8 +134,11 @@ def functional_train_task_sequence(
                     with torch.no_grad():
                         teacher_logits, _ = _functional_forward(model, teacher_params, x_old)
                     student_logits, _ = _functional_forward(model, params, x_old)
+                    features = feature_tracker.get_feature_matrix()
+                    _, stability_control = controller(features)
+                    stab_scale = stability_control.mean()
                     stab_loss = F.mse_loss(student_logits, teacher_logits)
-                    stability_term = lambda_stab * stab_loss
+                    stability_term = lambda_stab * stab_scale * stab_loss
 
                 if stability_term is not None:
                     grad_task_hidden = torch.autograd.grad(
@@ -163,7 +167,7 @@ def functional_train_task_sequence(
                 )
 
                 features = feature_tracker.get_feature_matrix()
-                gates = controller(features)
+                gates, stability_control = controller(features)
                 _apply_gates_to_grads(grads_dict, gates)
 
                 diag_gates.append(
@@ -171,6 +175,8 @@ def functional_train_task_sequence(
                         "task": task_id + 1,
                         "gate_mean": float(gates.mean().detach().cpu()),
                         "gate_std": float(gates.std(unbiased=False).detach().cpu()),
+                        "stab_mean": float(stability_control.mean().detach().cpu()),
+                        "stab_std": float(stability_control.std(unbiased=False).detach().cpu()),
                     }
                 )
 

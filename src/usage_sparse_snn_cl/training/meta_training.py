@@ -141,13 +141,16 @@ def meta_train_controller(
                 f"[meta] task1_loss={first['loss'].item():.4f}, "
                 f"task{last['task']}_loss={last['loss'].item():.4f}"
             )
-        if "gate_stats" in episode_metrics:
+        if "gate_stats" in episode_metrics and episode_metrics["gate_stats"]:
             gate_means = [entry["gate_mean"] for entry in episode_metrics["gate_stats"]]
             gate_stds = [entry["gate_std"] for entry in episode_metrics["gate_stats"]]
-            if gate_means:
-                print(
-                    f"[meta] gate_mean={sum(gate_means)/len(gate_means):.3f}, "
-                    f"gate_std={sum(gate_stds)/len(gate_stds):.3f}"
-                )
+            stab_means = [entry["stab_mean"] for entry in episode_metrics["gate_stats"]]
+            stab_stds = [entry["stab_std"] for entry in episode_metrics["gate_stats"]]
+            print(
+                f"[meta] gate_mean={sum(gate_means)/len(gate_means):.3f}, "
+                f"gate_std={sum(gate_stds)/len(gate_stds):.3f}, "
+                f"stab_mean={sum(stab_means)/len(stab_means):.3f}, "
+                f"stab_std={sum(stab_stds)/len(stab_stds):.3f}"
+            )
 
     return controller
