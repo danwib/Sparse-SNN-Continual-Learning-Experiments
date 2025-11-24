@@ -263,6 +263,12 @@ def train_task_sequence(
     }
 
     num_tasks = len(task_loaders)
+    epochs_cfg = cfg["train"]["epochs_per_task"]
+    epochs_schedule = None
+    if isinstance(epochs_cfg, list):
+        epochs_schedule = [int(v) for v in epochs_cfg]
+    else:
+        default_epochs = int(epochs_cfg)
     for task_id, (train_loader, test_loader) in enumerate(task_loaders):
         print(f"\n=== Task {task_id+1}/{num_tasks} ===")
 
@@ -270,6 +276,11 @@ def train_task_sequence(
         # For Task 1: stability_buffer/teacher_model are None → no stability term.
         # For Task 2+: they are set → Design 1 distillation is active.
         lambda_stab = float(cfg["train"].get("lambda_stab", 0.0))
+
+        if epochs_schedule is not None:
+            epochs = epochs_schedule[task_id] if task_id < len(epochs_schedule) else epochs_schedule[-1]
+        else:
+            epochs = default_epochs
 
         train_single_task(
             model=model,
@@ -280,7 +291,7 @@ def train_task_sequence(
             train_loader=train_loader,
             replay_buffer=replay_buffer,
             device=device,
-            epochs=cfg["train"]["epochs_per_task"],
+            epochs=epochs,
             is_acquisition=True,
             stability_buffer=stability_buffer,
             teacher_model=teacher_model,

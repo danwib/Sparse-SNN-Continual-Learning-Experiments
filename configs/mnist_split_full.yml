@@ -19,7 +19,7 @@ model:
   v_th: 1.0
 
 train:
-  epochs_per_task: 3
+  epochs_per_task: [3, 6]
   lr: 0.001
   usage_decay: 0.99
   usage_alpha: 10.0
