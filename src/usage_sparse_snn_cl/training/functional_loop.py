@@ -90,16 +90,19 @@ def functional_train_task_sequence(
     max_batches = cfg["train"].get("max_batches_per_epoch")
     truncate_window = cfg["train"].get("truncate_window")
     steps_since_trunc = 0
+    mid_eval_batches = cfg["train"].get("mid_eval_batches")
 
     teacher_params = None
     stability_batcher = None
 
     final_eval: List[Dict[str, Any]] = []
     diag_gates: List[Dict[str, float]] = []
+    mid_eval: List[Dict[str, Any]] = []
 
     for task_id, (train_loader, test_loader) in enumerate(task_loaders):
         print(f"[functional] task {task_id+1}/{len(task_loaders)}")
 
+        mid_recorded = False
         for epoch in range(cfg["train"]["epochs_per_task"]):
             batch_iter = iter(train_loader)
             batch_count = 0
@@ -199,6 +202,22 @@ def functional_train_task_sequence(
                 if replay_buffer is not None:
                     replay_buffer.add_batch(x.detach(), y.detach())
 
+                if (
+                    not mid_recorded
+                    and mid_eval_batches is not None
+                    and batch_count >= mid_eval_batches
+                ):
+                    mid_recorded = True
+                    x_mid, y_mid = next(iter(test_loader))
+                    x_mid = flatten_and_normalise(x_mid).to(device)
+                    y_mid = y_mid.to(device)
+                    logits_mid, _ = _functional_forward(model, params, x_mid)
+                    loss_mid = F.cross_entropy(logits_mid, y_mid)
+                    acc_mid = (logits_mid.argmax(dim=1) == y_mid).float().mean()
+                    mid_eval.append(
+                        {"task": task_id + 1, "loss": loss_mid, "acc": acc_mid}
+                    )
+
         # After acquisition, optional consolidation (non-differentiable)
         if replay_buffer is not None and len(replay_buffer) > 0:
             params = run_consolidation_phase(
@@ -229,6 +248,7 @@ def functional_train_task_sequence(
 
     return {
         "final_eval": final_eval,
+        "mid_eval": mid_eval,
         "gate_stats": diag_gates,
     }
 
