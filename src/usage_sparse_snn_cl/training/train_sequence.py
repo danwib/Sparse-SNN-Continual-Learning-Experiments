@@ -7,8 +7,9 @@ from torch.utils.data import DataLoader
 
 from usage_sparse_snn_cl.training.usage_tracker import UsageTracker, UsageConfig
 from usage_sparse_snn_cl.training.replay_buffer import ReplayBuffer
+from usage_sparse_snn_cl.training.neuron_features import NeuronFeatureTracker, NeuronFeatureConfig
+from usage_sparse_snn_cl.training.controllers import PerNeuronController
 from usage_sparse_snn_cl.data.mnist_split import flatten_and_normalise
-from usage_sparse_snn_cl.training.replay_buffer import ReplayBuffer
 
 
 import copy
@@ -38,10 +39,31 @@ def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return (preds == targets).float().mean().item()
 
 
+def apply_neuron_gates(model: nn.Module, gates: torch.Tensor) -> None:
+    """
+    Applies per-neuron gates to the hidden layer gradients.
+    gates: (hidden_size,) tensor in [0,1]
+    """
+    gates = gates.clamp(0.0, 1.0)
+    hidden_linear: nn.Linear = model.hidden.linear
+    readout: nn.Linear = model.readout
+
+    if hidden_linear.weight.grad is not None:
+        hidden_linear.weight.grad.mul_(gates.unsqueeze(1))
+    if hidden_linear.bias.grad is not None:
+        hidden_linear.bias.grad.mul_(gates)
+
+    if readout.weight.grad is not None:
+        readout.weight.grad.mul_(gates.unsqueeze(0))
+    # readout bias is not neuron-specific; leave untouched.
+
+
 def train_single_task(
     model: nn.Module,
     optimizer: optim.Optimizer,
     usage_tracker: UsageTracker,
+    feature_tracker: NeuronFeatureTracker | None,
+    controller: nn.Module | None,
     train_loader: DataLoader,
     replay_buffer: ReplayBuffer | None,
     device: torch.device,
@@ -72,6 +94,10 @@ def train_single_task(
             if lambda_spike > 0.0 and "hidden_spike_rate" in aux:
                 spike_rate = aux["hidden_spike_rate"]
                 loss = loss + lambda_spike * spike_rate.mean()
+                if feature_tracker is not None:
+                    feature_tracker.update_spike_rates(spike_rate.detach())
+            elif feature_tracker is not None and "hidden_spike_rate" in aux:
+                feature_tracker.update_spike_rates(aux["hidden_spike_rate"].detach())
 
             # Stability / distillation loss on previous tasks (Design 1)
             if (
@@ -96,8 +122,14 @@ def train_single_task(
 
             # update usage from grads
             usage_tracker.update_from_grads()
+            if feature_tracker is not None:
+                feature_tracker.update_usage_from_tracker(usage_tracker)
 
             if is_acquisition:
+                if controller is not None and feature_tracker is not None:
+                    with torch.no_grad():
+                        gates = controller(feature_tracker.get_feature_matrix())
+                        apply_neuron_gates(model, gates)
                 # scale grads so low-usage params learn faster
                 usage_tracker.scale_grads_for_new_task()
             else:
@@ -151,11 +183,27 @@ def train_task_sequence(
     )
     usage_tracker = UsageTracker(model=model, config=usage_cfg)
 
+    feature_tracker = NeuronFeatureTracker(
+        hidden_size=cfg["model"]["hidden_size"],
+        input_size=cfg["model"]["input_size"],
+        output_size=cfg["model"]["output_size"],
+        layer_id_normalised=0.5,
+        device=device,
+        config=NeuronFeatureConfig(),
+    )
+    feature_dim = feature_tracker.get_feature_matrix().shape[1]
+    controller = PerNeuronController(feature_dim=feature_dim).to(device)
+
     replay_buffer = ReplayBuffer(cfg["train"]["replay_buffer_size"]) \
         if cfg["train"]["do_consolidation"] else None
 
     teacher_model = None
     stability_buffer = None
+
+    episode_metrics = {
+        "pre_consolidation": [],
+        "post_consolidation": [],
+    }
 
     num_tasks = len(task_loaders)
     for task_id, (train_loader, test_loader) in enumerate(task_loaders):
@@ -170,6 +218,8 @@ def train_task_sequence(
             model=model,
             optimizer=optimizer,
             usage_tracker=usage_tracker,
+            feature_tracker=feature_tracker,
+            controller=controller,
             train_loader=train_loader,
             replay_buffer=replay_buffer,
             device=device,
@@ -181,6 +231,7 @@ def train_task_sequence(
         )
 
         # eval on all tasks so far (simple CL metric)
+        pre_eval_stats: List[Dict[str, float]] = []
         for eval_id in range(task_id + 1):
             _, eval_loader = task_loaders[eval_id]
             acc, mean_spike = evaluate(model, eval_loader, device)
@@ -188,6 +239,10 @@ def train_task_sequence(
                 f"  pre-consol eval on task {eval_id+1}: "
                 f"acc={acc:.3f}, mean_hidden_spike_rate={mean_spike:.4f}"
             )
+            pre_eval_stats.append(
+                {"task": eval_id + 1, "acc": acc, "mean_hidden_spike_rate": mean_spike}
+            )
+        episode_metrics["pre_consolidation"].append(pre_eval_stats)
 
 
 
@@ -268,6 +323,7 @@ def train_task_sequence(
 
         # 2b) Evaluate again after consolidation to see its effect
         print("  post-consol evals:")
+        post_eval_stats: List[Dict[str, float]] = []
         for eval_id in range(task_id + 1):
             _, eval_loader = task_loaders[eval_id]
             acc_post, mean_spike_post = evaluate(model, eval_loader, device)
@@ -275,10 +331,16 @@ def train_task_sequence(
                 f"    task {eval_id+1}: "
                 f"acc={acc_post:.3f}, mean_hidden_spike_rate={mean_spike_post:.4f}"
             )
+            post_eval_stats.append(
+                {"task": eval_id + 1, "acc": acc_post, "mean_hidden_spike_rate": mean_spike_post}
+            )
+        episode_metrics["post_consolidation"].append(post_eval_stats)
 
 
         # 3) Prune to restore sparsity
         usage_tracker.prune_small(cfg["train"]["prune_threshold"])
+        if feature_tracker is not None:
+            feature_tracker.snapshot_past_spike_rates()
 
         # 4) Report some stats
         w_sparsity = weight_sparsity(model)
@@ -308,3 +370,5 @@ def train_task_sequence(
                 x_flat = flatten_and_normalise(x_batch)
                 stability_buffer.add_batch(x_flat, y_batch)
             print(f"  stability buffer filled with {len(stability_buffer)} Task-1 batches")
+
+    return episode_metrics
