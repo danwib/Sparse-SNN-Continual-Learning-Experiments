@@ -77,7 +77,7 @@ def run_full_training(cfg: dict, device: torch.device, controller_path: Path) ->
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta-config", type=str, required=True, help="Config for meta-training phase")
-    parser.add_argument("--full-config", type=str, default=None, help="Config for full training (defaults to meta config)")
+    parser.add_argument("--full-config", type=str, required=True, help="Config for full training/eval phase")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--epochs-per-task", type=int, default=3)
     parser.add_argument("--consol-epochs", type=int, default=2)
@@ -91,7 +91,7 @@ def main():
     args = parser.parse_args()
 
     meta_cfg_path = Path(args.meta_config)
-    full_cfg_path = Path(args.full_config) if args.full_config else meta_cfg_path
+    full_cfg_path = Path(args.full_config)
 
     meta_cfg_dict = load_config(meta_cfg_path)
     full_cfg_dict = load_config(full_cfg_path)
