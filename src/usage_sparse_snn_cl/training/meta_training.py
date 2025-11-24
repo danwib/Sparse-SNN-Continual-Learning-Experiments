@@ -131,5 +131,20 @@ def meta_train_controller(
         meta_optimizer.step()
 
         print(f"[meta] objective={objective.item():.4f}")
+        if "final_eval" in episode_metrics:
+            first = episode_metrics["final_eval"][0]
+            last = episode_metrics["final_eval"][-1]
+            print(
+                f"[meta] task1_loss={first['loss'].item():.4f}, "
+                f"task{last['task']}_loss={last['loss'].item():.4f}"
+            )
+        if "gate_stats" in episode_metrics:
+            gate_means = [entry["gate_mean"] for entry in episode_metrics["gate_stats"]]
+            gate_stds = [entry["gate_std"] for entry in episode_metrics["gate_stats"]]
+            if gate_means:
+                print(
+                    f"[meta] gate_mean={sum(gate_means)/len(gate_means):.3f}, "
+                    f"gate_std={sum(gate_stds)/len(gate_stds):.3f}"
+                )
 
     return controller

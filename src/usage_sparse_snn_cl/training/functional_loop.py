@@ -93,6 +93,7 @@ def functional_train_task_sequence(
     stability_batcher = None
 
     final_eval: List[Dict[str, Any]] = []
+    diag_gates: List[Dict[str, float]] = []
 
     for task_id, (train_loader, test_loader) in enumerate(task_loaders):
         print(f"[functional] task {task_id+1}/{len(task_loaders)}")
@@ -159,8 +160,17 @@ def functional_train_task_sequence(
                     grads_dict.get("hidden.linear.bias"),
                 )
 
-                gates = controller(feature_tracker.get_feature_matrix())
+                features = feature_tracker.get_feature_matrix()
+                gates = controller(features)
                 _apply_gates_to_grads(grads_dict, gates)
+
+                diag_gates.append(
+                    {
+                        "task": task_id + 1,
+                        "gate_mean": float(gates.mean().detach().cpu()),
+                        "gate_std": float(gates.std(unbiased=False).detach().cpu()),
+                    }
+                )
 
                 new_params = OrderedDict()
                 for (name, p) in params.items():
@@ -204,6 +214,7 @@ def functional_train_task_sequence(
 
     return {
         "final_eval": final_eval,
+        "gate_stats": diag_gates,
     }
 
 
