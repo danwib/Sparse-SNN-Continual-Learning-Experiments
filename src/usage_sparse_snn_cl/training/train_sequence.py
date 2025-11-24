@@ -58,6 +58,21 @@ def apply_neuron_gates(model: nn.Module, gates: torch.Tensor) -> None:
     # readout bias is not neuron-specific; leave untouched.
 
 
+def _clone_hidden_weight_grad(model: nn.Module) -> torch.Tensor | None:
+    grad = model.hidden.linear.weight.grad
+    if grad is None:
+        return None
+    return grad.detach().clone()
+
+
+def _per_neuron_cosine_similarity(grad_a: torch.Tensor, grad_b: torch.Tensor) -> torch.Tensor:
+    eps = 1e-8
+    dot = (grad_a * grad_b).sum(dim=1)
+    norm_a = torch.norm(grad_a, dim=1)
+    norm_b = torch.norm(grad_b, dim=1)
+    return dot / (norm_a * norm_b + eps)
+
+
 def train_single_task(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -89,16 +104,19 @@ def train_single_task(
             optimizer.zero_grad()
             logits, aux = model(x)
 
-            loss = ce(logits, y)
+            loss_task = ce(logits, y)
             # spike sparsity: encourage low average hidden spike rate
             if lambda_spike > 0.0 and "hidden_spike_rate" in aux:
                 spike_rate = aux["hidden_spike_rate"]
-                loss = loss + lambda_spike * spike_rate.mean()
+                spike_mean = spike_rate.mean()
+                loss_task = loss_task + lambda_spike * spike_mean
                 if feature_tracker is not None:
                     feature_tracker.update_spike_rates(spike_rate.detach())
             elif feature_tracker is not None and "hidden_spike_rate" in aux:
                 feature_tracker.update_spike_rates(aux["hidden_spike_rate"].detach())
 
+            stability_term = None
+            stab_loss = None
             # Stability / distillation loss on previous tasks (Design 1)
             if (
                 is_acquisition
@@ -115,10 +133,37 @@ def train_single_task(
 
                 student_logits, _ = model(x_old)
                 stab_loss = F.mse_loss(student_logits, teacher_logits)
-                loss = loss + lambda_stab * stab_loss
+                stability_term = lambda_stab * stab_loss
 
+            total_loss = loss_task
+            if stability_term is not None:
+                total_loss = total_loss + stability_term
 
-            loss.backward()
+            # Gradient-based feature updates (conflict / stability)
+            if (
+                feature_tracker is not None
+                and stability_term is not None
+                and is_acquisition
+            ):
+                optimizer.zero_grad()
+                loss_task.backward(retain_graph=True)
+                grad_task = _clone_hidden_weight_grad(model)
+                optimizer.zero_grad()
+                stability_term.backward(retain_graph=True)
+                grad_stab = _clone_hidden_weight_grad(model)
+                optimizer.zero_grad()
+
+                if grad_task is not None and grad_stab is not None:
+                    conflict = _per_neuron_cosine_similarity(grad_task, grad_stab)
+                    stability_signal = torch.norm(grad_stab, dim=1)
+                    feature_tracker.update_grad_conflict(conflict)
+                    feature_tracker.update_stability_error(stability_signal)
+            elif feature_tracker is not None:
+                zeros = torch.zeros_like(feature_tracker.spike_rate_fast)
+                feature_tracker.update_grad_conflict(zeros)
+                feature_tracker.update_stability_error(zeros)
+
+            total_loss.backward()
 
             # update usage from grads
             usage_tracker.update_from_grads()
@@ -127,9 +172,8 @@ def train_single_task(
 
             if is_acquisition:
                 if controller is not None and feature_tracker is not None:
-                    with torch.no_grad():
-                        gates = controller(feature_tracker.get_feature_matrix())
-                        apply_neuron_gates(model, gates)
+                    gates = controller(feature_tracker.get_feature_matrix())
+                    apply_neuron_gates(model, gates)
                 # scale grads so low-usage params learn faster
                 usage_tracker.scale_grads_for_new_task()
             else:
@@ -173,7 +217,9 @@ def train_task_sequence(
     task_loaders: List[Tuple[DataLoader, DataLoader]],
     cfg: Dict[str, Any],
     device: torch.device,
-) -> None:
+    feature_tracker: NeuronFeatureTracker | None = None,
+    controller: nn.Module | None = None,
+) -> Dict[str, Any]:
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=cfg["train"]["lr"])
 
@@ -183,16 +229,21 @@ def train_task_sequence(
     )
     usage_tracker = UsageTracker(model=model, config=usage_cfg)
 
-    feature_tracker = NeuronFeatureTracker(
-        hidden_size=cfg["model"]["hidden_size"],
-        input_size=cfg["model"]["input_size"],
-        output_size=cfg["model"]["output_size"],
-        layer_id_normalised=0.5,
-        device=device,
-        config=NeuronFeatureConfig(),
-    )
-    feature_dim = feature_tracker.get_feature_matrix().shape[1]
-    controller = PerNeuronController(feature_dim=feature_dim).to(device)
+    if feature_tracker is None:
+        feature_tracker = NeuronFeatureTracker(
+            hidden_size=cfg["model"]["hidden_size"],
+            input_size=cfg["model"]["input_size"],
+            output_size=cfg["model"]["output_size"],
+            layer_id_normalised=0.5,
+            device=device,
+            config=NeuronFeatureConfig(),
+        )
+    feature_tracker.to(device)
+
+    if controller is None:
+        feature_dim = feature_tracker.get_feature_matrix().shape[1]
+        controller = PerNeuronController(feature_dim=feature_dim)
+    controller.to(device)
 
     replay_buffer = ReplayBuffer(cfg["train"]["replay_buffer_size"]) \
         if cfg["train"]["do_consolidation"] else None
