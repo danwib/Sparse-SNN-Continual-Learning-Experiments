@@ -14,7 +14,7 @@ from usage_sparse_snn_cl.training.meta_objective import (
     MetaObjectiveConfig,
     stability_plasticity_objective,
 )
-from usage_sparse_snn_cl.training.train_sequence import train_task_sequence
+from usage_sparse_snn_cl.training.functional_loop import functional_train_task_sequence
 
 
 @dataclass
@@ -77,13 +77,13 @@ def meta_train_controller(
 
         feature_tracker = _make_feature_tracker(cfg, device)
 
-        episode_metrics = train_task_sequence(
+        episode_metrics = functional_train_task_sequence(
             model=model,
             task_loaders=loaders,
             cfg=cfg,
             device=device,
-            feature_tracker=feature_tracker,
             controller=controller,
+            feature_tracker=feature_tracker,
         )
 
         objective = stability_plasticity_objective(episode_metrics, meta_cfg.objective)

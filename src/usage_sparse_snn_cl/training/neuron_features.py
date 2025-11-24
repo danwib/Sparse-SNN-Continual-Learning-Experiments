@@ -16,6 +16,7 @@ class NeuronFeatureConfig:
     spike_decay_slow: float = 0.05  # slow EMA for long-term activity
     conflict_decay: float = 0.2     # EMA on gradient conflict
     stability_decay: float = 0.2    # EMA on stability / teacher error
+    usage_decay: float = 0.1        # EMA on gradient-derived usage
 
 
 class NeuronFeatureTracker:
@@ -99,6 +100,15 @@ class NeuronFeatureTracker:
             per_neuron = 0.5 * (per_neuron + bias_usage)
 
         self.usage.copy_(per_neuron.to(self.device))
+
+    def update_usage_from_gradients(self, grad_weight: torch.Tensor, grad_bias: torch.Tensor | None = None) -> None:
+        """
+        Updates usage EMA using raw gradient magnitudes (without a UsageTracker).
+        """
+        grad_mag = grad_weight.detach().abs().mean(dim=1)
+        if grad_bias is not None:
+            grad_mag = 0.5 * (grad_mag + grad_bias.detach().abs())
+        self._ema_update(self.usage, grad_mag, self.config.usage_decay)
 
     def update_grad_conflict(self, conflict_signal: torch.Tensor) -> None:
         """

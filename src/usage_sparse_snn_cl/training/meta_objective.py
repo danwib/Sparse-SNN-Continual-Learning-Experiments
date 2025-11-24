@@ -17,25 +17,23 @@ class MetaObjectiveConfig:
 
 
 def stability_plasticity_objective(
-    episode_metrics: Dict[str, List[List[Dict[str, float]]]],
+    episode_metrics: Dict[str, List[Dict[str, torch.Tensor]]],
     config: MetaObjectiveConfig,
 ) -> torch.Tensor:
     """
-    Produces a scalar objective that can supervise the Level-2 controller.
-    Uses the stored episode metrics emitted by `train_task_sequence`.
-    Currently combines:
-      - stability: accuracy on the very first task after the final post-consolidation eval
-      - plasticity: accuracy on the most recent task after the final post-consolidation eval
+    Differentiable proxy objective for the controller.
+    Uses per-task evaluation losses recorded at the end of the episode.
+    Encourages low CE loss on Task 1 (stability) and on the latest task (plasticity).
     """
-    if not episode_metrics["post_consolidation"]:
-        return torch.tensor(0.0)
+    final_eval = episode_metrics.get("final_eval", [])
+    if not final_eval:
+        return torch.tensor(0.0, dtype=torch.float32)
 
-    final_post = episode_metrics["post_consolidation"][-1]
-    stability_acc = final_post[0]["acc"]
-    plasticity_acc = final_post[-1]["acc"]
+    stability_loss = final_eval[0]["loss"]
+    plasticity_loss = final_eval[-1]["loss"]
 
-    score = (
-        config.stability_weight * stability_acc
-        + config.plasticity_weight * plasticity_acc
+    score = -(
+        config.stability_weight * stability_loss
+        + config.plasticity_weight * plasticity_loss
     )
-    return torch.tensor(score, dtype=torch.float32)
+    return score
