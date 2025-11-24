@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import copy
 import torch
 from torch import optim
 
@@ -28,6 +29,35 @@ class MetaTrainingConfig:
     objective: MetaObjectiveConfig = field(default_factory=MetaObjectiveConfig)
 
 
+@dataclass
+class ResourceLimitConfig:
+    """
+    Optional overrides that keep meta episodes lightweight.
+    """
+
+    max_batches_per_epoch: Optional[int] = None
+    max_consolidation_batches: Optional[int] = None
+    epochs_per_task: Optional[int] = None
+    consolidation_epochs: Optional[int] = None
+    num_workers: int = 0  # default to single-process loading for safety
+
+
+def _apply_resource_limits(cfg: Dict[str, Any], limits: ResourceLimitConfig) -> Dict[str, Any]:
+    scoped = copy.deepcopy(cfg)
+    train_cfg = scoped.setdefault("train", {})
+    if limits.max_batches_per_epoch is not None:
+        train_cfg["max_batches_per_epoch"] = limits.max_batches_per_epoch
+    if limits.max_consolidation_batches is not None:
+        train_cfg["max_consolidation_batches"] = limits.max_consolidation_batches
+    if limits.epochs_per_task is not None:
+        train_cfg["epochs_per_task"] = limits.epochs_per_task
+    if limits.consolidation_epochs is not None:
+        train_cfg["consolidation_epochs"] = limits.consolidation_epochs
+    train_cfg.setdefault("do_consolidation", True)
+    scoped.setdefault("data", {})["num_workers"] = limits.num_workers
+    return scoped
+
+
 def _make_feature_tracker(cfg: Dict[str, Any], device: torch.device) -> NeuronFeatureTracker:
     tracker = NeuronFeatureTracker(
         hidden_size=cfg["model"]["hidden_size"],
@@ -45,12 +75,17 @@ def meta_train_controller(
     cfg: Dict[str, Any],
     device: torch.device,
     meta_cfg: MetaTrainingConfig,
+    resource_limits: Optional[ResourceLimitConfig] = None,
 ) -> PerNeuronController:
     """
     Runs multiple continual-learning episodes and updates the controller parameters
     using the chosen meta-objective.
     """
-    feature_tracker_template = _make_feature_tracker(cfg, device)
+    base_cfg = copy.deepcopy(cfg)
+    if resource_limits is not None:
+        base_cfg = _apply_resource_limits(base_cfg, resource_limits)
+
+    feature_tracker_template = _make_feature_tracker(base_cfg, device)
     feature_dim = feature_tracker_template.get_feature_matrix().shape[1]
 
     controller = PerNeuronController(feature_dim=feature_dim).to(device)
@@ -59,28 +94,30 @@ def meta_train_controller(
     for episode in range(meta_cfg.episodes):
         print(f"[meta] episode {episode+1}/{meta_cfg.episodes}")
         # Fresh model + data loaders per episode
+        episode_cfg = copy.deepcopy(base_cfg)
+
         model = SimpleSNNMLP(
-            input_size=cfg["model"]["input_size"],
-            hidden_size=cfg["model"]["hidden_size"],
-            output_size=cfg["model"]["output_size"],
-            time_steps=cfg["model"]["time_steps"],
-            v_th=cfg["model"]["v_th"],
+            input_size=episode_cfg["model"]["input_size"],
+            hidden_size=episode_cfg["model"]["hidden_size"],
+            output_size=episode_cfg["model"]["output_size"],
+            time_steps=episode_cfg["model"]["time_steps"],
+            v_th=episode_cfg["model"]["v_th"],
         )
         model.to(device)
 
         loaders = make_mnist_split_loaders(
-            root=cfg["data"]["root"],
-            splits=cfg["data"]["splits"],
-            batch_size=cfg["data"]["batch_size"],
-            num_workers=cfg["data"]["num_workers"],
+            root=episode_cfg["data"]["root"],
+            splits=episode_cfg["data"]["splits"],
+            batch_size=episode_cfg["data"]["batch_size"],
+            num_workers=episode_cfg["data"]["num_workers"],
         )
 
-        feature_tracker = _make_feature_tracker(cfg, device)
+        feature_tracker = _make_feature_tracker(episode_cfg, device)
 
         episode_metrics = functional_train_task_sequence(
             model=model,
             task_loaders=loaders,
-            cfg=cfg,
+            cfg=episode_cfg,
             device=device,
             controller=controller,
             feature_tracker=feature_tracker,
