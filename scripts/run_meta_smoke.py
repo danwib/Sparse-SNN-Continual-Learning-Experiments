@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--max-consol-batches", type=int, default=2)
     parser.add_argument("--epochs-per-task", type=int, default=1)
     parser.add_argument("--consol-epochs", type=int, default=1)
+    parser.add_argument("--truncate-window", type=int, default=5)
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
@@ -41,6 +42,7 @@ def main():
         epochs_per_task=args.epochs_per_task,
         consolidation_epochs=args.consol_epochs,
         num_workers=0,
+        truncate_window=args.truncate_window,
     )
 
     controller = meta_train_controller(cfg, device, meta_cfg, resource_limits=resource_cfg)

@@ -88,6 +88,8 @@ def functional_train_task_sequence(
     do_consolidation = cfg["train"].get("do_consolidation", False)
     replay_buffer = ReplayBuffer(cfg["train"]["replay_buffer_size"]) if do_consolidation else None
     max_batches = cfg["train"].get("max_batches_per_epoch")
+    truncate_window = cfg["train"].get("truncate_window")
+    steps_since_trunc = 0
 
     teacher_params = None
     stability_batcher = None
@@ -180,6 +182,13 @@ def functional_train_task_sequence(
                     else:
                         new_params[name] = p - lr * grad
                 params = new_params
+                steps_since_trunc += 1
+
+                if truncate_window is not None and steps_since_trunc >= truncate_window:
+                    params = OrderedDict(
+                        (name, p.detach().clone().requires_grad_(True)) for name, p in params.items()
+                    )
+                    steps_since_trunc = 0
 
                 if replay_buffer is not None:
                     replay_buffer.add_batch(x.detach(), y.detach())

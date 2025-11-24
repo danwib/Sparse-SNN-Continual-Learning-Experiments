@@ -40,6 +40,7 @@ class ResourceLimitConfig:
     epochs_per_task: Optional[int] = None
     consolidation_epochs: Optional[int] = None
     num_workers: int = 0  # default to single-process loading for safety
+    truncate_window: Optional[int] = None
 
 
 def _apply_resource_limits(cfg: Dict[str, Any], limits: ResourceLimitConfig) -> Dict[str, Any]:
@@ -54,6 +55,8 @@ def _apply_resource_limits(cfg: Dict[str, Any], limits: ResourceLimitConfig) -> 
     if limits.consolidation_epochs is not None:
         train_cfg["consolidation_epochs"] = limits.consolidation_epochs
     train_cfg.setdefault("do_consolidation", True)
+    if limits.truncate_window is not None:
+        train_cfg["truncate_window"] = limits.truncate_window
     scoped.setdefault("data", {})["num_workers"] = limits.num_workers
     return scoped
 

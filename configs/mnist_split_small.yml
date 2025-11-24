@@ -37,6 +37,7 @@ train:
   prune_threshold: 0.0005
   max_batches_per_epoch: null
   max_consolidation_batches: null
+  truncate_window: null
 
   # NEW: stability/distillation on Task 1 during Task 2 training
   lambda_stab: 0.25          # you can tune this
