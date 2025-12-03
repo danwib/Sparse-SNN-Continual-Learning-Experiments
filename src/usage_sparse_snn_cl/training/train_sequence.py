@@ -290,9 +290,11 @@ def train_single_task(
             stability_term = None
             stab_loss = None
             stability_control = None
+            gates_ctrl = None
             # Stability / distillation loss on previous tasks (Design 1)
             if controller is not None and feature_tracker is not None:
                 feature_matrix = feature_tracker.get_feature_matrix()
+                gates_ctrl, stability_control = controller(feature_matrix)
             else:
                 feature_matrix = None
 
@@ -301,11 +303,9 @@ def train_single_task(
                 and is_acquisition
                 and lambda_stab > 0.0
             ):
-                stab_scale = 1.0
-                stability_control = None
-                if controller is not None and feature_matrix is not None:
-                    _, stability_control = controller(feature_matrix)
-                    stab_scale = stability_control.mean()
+                stab_scale = (
+                    stability_control.mean() if stability_control is not None else 1.0
+                )
 
                 if stability_surrogate is not None:
                     spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
@@ -314,7 +314,7 @@ def train_single_task(
                         loss_task=loss_task.detach(),
                         batch_acc=accuracy(logits, y),
                         spike_batch=spike_batch.detach() if spike_batch is not None else None,
-                        gates=None,
+                        gates=gates_ctrl.detach() if gates_ctrl is not None else None,
                         stability_control=stability_control.detach() if stability_control is not None else None,
                         logits=logits.detach(),
                         inputs=x.detach(),
@@ -343,8 +343,6 @@ def train_single_task(
                 and stability_snapshot is not None
                 and lambda_stab > 0.0
             ):
-                if controller is not None and feature_matrix is not None:
-                    _, stability_control = controller(feature_matrix)
                 stability_term = lambda_stab * controller_stability_penalty(
                     model, stability_snapshot, stability_control
                 )
@@ -385,9 +383,8 @@ def train_single_task(
                 feature_tracker.update_usage_from_tracker(usage_tracker)
 
             if is_acquisition:
-                if controller is not None and feature_tracker is not None:
-                    gates, _ = controller(feature_tracker.get_feature_matrix())
-                    apply_neuron_gates(model, gates)
+                if gates_ctrl is not None:
+                    apply_neuron_gates(model, gates_ctrl)
                 # scale grads so low-usage params learn faster
                 usage_tracker.scale_grads_for_new_task()
             else:
