@@ -306,7 +306,7 @@ def train_single_task(
 
     model.train()
     ce = nn.CrossEntropyLoss()
-    prev_grad_stats: torch.Tensor | None = None
+    prev_grad_stats = torch.zeros(3, device=device)
     if trainable_params is None:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
 

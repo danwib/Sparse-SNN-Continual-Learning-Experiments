@@ -119,6 +119,8 @@ def build_surrogate_descriptor(
     stats.extend([logits_stats, input_stats, scalars])
     if grad_stats is not None:
         stats.append(grad_stats.to(device))
+    else:
+        stats.append(torch.zeros(3, device=device))
     return torch.cat(stats).detach()
 
 
