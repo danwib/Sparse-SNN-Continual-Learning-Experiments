@@ -144,17 +144,7 @@ def controller_stability_penalty(
     return penalty / terms
 
 
-def _gradient_statistics(
-    loss: torch.Tensor,
-    params: List[torch.Tensor],
-) -> torch.Tensor | None:
-    grads = torch.autograd.grad(
-        loss,
-        params,
-        retain_graph=True,
-        allow_unused=True,
-        create_graph=False,
-    )
+def _grad_stats_from_tensor_list(grads: List[torch.Tensor]) -> torch.Tensor | None:
     flats: List[torch.Tensor] = []
     for grad in grads:
         if grad is not None:
@@ -242,7 +232,14 @@ def _run_surrogate_warmup(
             gates = g.detach()
             stability_control = s.detach()
 
-        grad_stats = _gradient_statistics(loss_task, trainable_params)
+        grads = torch.autograd.grad(
+            loss_task,
+            trainable_params,
+            retain_graph=False,
+            allow_unused=True,
+            create_graph=False,
+        )
+        grad_stats = _grad_stats_from_tensor_list([g for g in grads if g is not None])
 
         descriptor = build_surrogate_descriptor(
             feature_matrix=feature_matrix,
@@ -309,6 +306,7 @@ def train_single_task(
 
     model.train()
     ce = nn.CrossEntropyLoss()
+    prev_grad_stats: torch.Tensor | None = None
     if trainable_params is None:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
 
@@ -344,7 +342,7 @@ def train_single_task(
             )
             if controller is not None and feature_matrix is not None:
                 gates_ctrl, stability_control = controller(feature_matrix)
-            grad_stats = None
+            grad_stats = prev_grad_stats
 
             use_surrogate_gate = (
                 stability_mode == "distillation"
@@ -355,7 +353,6 @@ def train_single_task(
             )
             surrogate_gate = None
             if use_surrogate_gate:
-                grad_stats = _gradient_statistics(loss_task, trainable_params)
                 spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
                 batch_descriptor = build_surrogate_descriptor(
                     feature_matrix=feature_matrix.detach() if feature_matrix is not None else None,
@@ -441,8 +438,14 @@ def train_single_task(
 
             total_loss.backward()
 
+            grad_list = [p.grad for p in trainable_params]
+            grad_stats_current = _grad_stats_from_tensor_list(
+                [g.detach() for g in grad_list if g is not None]
+            )
+            prev_grad_stats = grad_stats_current
+
             if gate_scale is not None:
-                for p in model.parameters():
+                for p in trainable_params:
                     if p.grad is not None:
                         p.grad.mul_(gate_scale)
 
