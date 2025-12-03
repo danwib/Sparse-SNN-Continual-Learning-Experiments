@@ -356,6 +356,7 @@ def train_single_task(
                 feature_tracker is not None
                 and stability_term is not None
                 and is_acquisition
+                and stability_term.requires_grad
             ):
                 optimizer.zero_grad()
                 loss_task.backward(retain_graph=True)
