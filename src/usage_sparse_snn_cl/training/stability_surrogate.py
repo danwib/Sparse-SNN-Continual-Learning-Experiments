@@ -22,6 +22,7 @@ class StabilitySurrogateConfig:
     lr: float = 1e-3
     epochs: int = 200
     batch_size: Optional[int] = None
+    gate_beta: float = 25.0
 
 
 class StabilitySurrogate(nn.Module):
@@ -41,7 +42,7 @@ class StabilitySurrogate(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        return torch.sigmoid(self.net(x)).squeeze(-1)
 
 
 def _summarise_matrix(features: torch.Tensor) -> torch.Tensor:
@@ -169,4 +170,13 @@ def make_surrogate_config(config_dict: Optional[Dict[str, Any]]) -> StabilitySur
         lr=float(config_dict.get("lr", 1e-3)),
         epochs=int(config_dict.get("epochs", 200)),
         batch_size=config_dict.get("batch_size"),
+        gate_beta=float(config_dict.get("gate_beta", 25.0)),
     )
+
+
+def loss_to_gate(stab_loss: torch.Tensor, beta: float) -> torch.Tensor:
+    """
+    Maps a teacher distillation loss to a [0,1] gate: high loss → strong attenuation.
+    """
+    gate = torch.exp(-beta * stab_loss)
+    return gate.clamp(0.0, 1.0)

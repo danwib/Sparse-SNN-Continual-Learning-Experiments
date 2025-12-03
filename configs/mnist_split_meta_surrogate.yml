@@ -43,3 +43,4 @@ train:
   stability_surrogate:
     enabled: false
     warmup_batches: 0
+    gate_beta: 25.0

@@ -48,3 +48,4 @@ train:
     lr: 0.001
     epochs: 200
     batch_size: null
+    gate_beta: 25.0

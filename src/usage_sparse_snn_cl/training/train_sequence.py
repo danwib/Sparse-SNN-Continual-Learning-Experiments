@@ -13,6 +13,7 @@ from usage_sparse_snn_cl.data.mnist_split import flatten_and_normalise
 from usage_sparse_snn_cl.training.stability_surrogate import (
     StabilitySurrogate,
     build_surrogate_descriptor,
+    loss_to_gate,
     make_surrogate_config,
     train_stability_surrogate,
 )
@@ -219,8 +220,9 @@ def _run_surrogate_warmup(
         with torch.no_grad():
             teacher_logits, _ = teacher_model(x_old)
         student_logits, _ = model(x_old)
-        stab_loss = F.mse_loss(student_logits, teacher_logits).detach().cpu()
-        targets.append(stab_loss)
+        stab_loss = F.mse_loss(student_logits, teacher_logits).detach()
+        gate_target = loss_to_gate(stab_loss, surrogate_cfg.gate_beta).cpu()
+        targets.append(gate_target)
 
     if not descriptors:
         print("  [surrogate] insufficient data for warm-up; skipping surrogate training.")
@@ -291,42 +293,47 @@ def train_single_task(
             stab_loss = None
             stability_control = None
             gates_ctrl = None
-            # Always fetch the feature matrix if available so descriptors stay consistent.
             feature_matrix = (
                 feature_tracker.get_feature_matrix() if feature_tracker is not None else None
             )
             if controller is not None and feature_matrix is not None:
                 gates_ctrl, stability_control = controller(feature_matrix)
 
-            if (
+            use_surrogate_gate = (
                 stability_mode == "distillation"
                 and is_acquisition
                 and lambda_stab > 0.0
-            ):
-                stab_scale = (
-                    stability_control.mean() if stability_control is not None else 1.0
-                )
+                and stability_surrogate is not None
+            )
+            surrogate_gate = None
+            if use_surrogate_gate:
+                spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
+                batch_descriptor = build_surrogate_descriptor(
+                    feature_matrix=feature_matrix.detach() if feature_matrix is not None else None,
+                    loss_task=loss_task.detach(),
+                    batch_acc=accuracy(logits, y),
+                    spike_batch=spike_batch.detach() if spike_batch is not None else None,
+                    gates=gates_ctrl.detach() if gates_ctrl is not None else None,
+                    stability_control=stability_control.detach() if stability_control is not None else None,
+                    logits=logits.detach(),
+                    inputs=x.detach(),
+                    lambda_stab=lambda_stab,
+                ).to(device)
+                with torch.no_grad():
+                    surrogate_gate = stability_surrogate(batch_descriptor.unsqueeze(0)).squeeze(0).item()
+                surrogate_gate = float(max(0.0, min(1.0, surrogate_gate)))
 
-                if stability_surrogate is not None:
-                    spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
-                    batch_descriptor = build_surrogate_descriptor(
-                        feature_matrix=feature_matrix.detach() if feature_matrix is not None else None,
-                        loss_task=loss_task.detach(),
-                        batch_acc=accuracy(logits, y),
-                        spike_batch=spike_batch.detach() if spike_batch is not None else None,
-                        gates=gates_ctrl.detach() if gates_ctrl is not None else None,
-                        stability_control=stability_control.detach() if stability_control is not None else None,
-                        logits=logits.detach(),
-                        inputs=x.detach(),
-                        lambda_stab=lambda_stab,
-                    ).to(device)
-                    with torch.no_grad():
-                        stab_loss = stability_surrogate(batch_descriptor.unsqueeze(0)).squeeze(0)
-                    stability_term = lambda_stab * stab_scale * stab_loss
-                elif (
-                    stability_buffer is not None
+            if not use_surrogate_gate:
+                if (
+                    stability_mode == "distillation"
+                    and is_acquisition
+                    and lambda_stab > 0.0
+                    and stability_buffer is not None
                     and teacher_model is not None
                 ):
+                    stab_scale = (
+                        stability_control.mean() if stability_control is not None else 1.0
+                    )
                     # Sample a batch of Task-1 inputs
                     x_old, _ = stability_buffer.sample(train_loader.batch_size)
                     x_old = x_old.to(device)
@@ -337,19 +344,23 @@ def train_single_task(
                     student_logits, _ = model(x_old)
                     stab_loss = F.mse_loss(student_logits, teacher_logits)
                     stability_term = lambda_stab * stab_scale * stab_loss
-            elif (
-                stability_mode == "controller_reg"
-                and is_acquisition
-                and stability_snapshot is not None
-                and lambda_stab > 0.0
-            ):
-                stability_term = lambda_stab * controller_stability_penalty(
-                    model, stability_snapshot, stability_control
-                )
+                elif (
+                    stability_mode == "controller_reg"
+                    and is_acquisition
+                    and stability_snapshot is not None
+                    and lambda_stab > 0.0
+                ):
+                    stability_term = lambda_stab * controller_stability_penalty(
+                        model, stability_snapshot, stability_control
+                    )
 
             total_loss = loss_task
             if stability_term is not None:
                 total_loss = total_loss + stability_term
+
+            gate_scale = None
+            if surrogate_gate is not None:
+                gate_scale = 1.0 - lambda_stab * (1.0 - surrogate_gate)
 
             # Gradient-based feature updates (conflict / stability)
             if (
@@ -377,6 +388,11 @@ def train_single_task(
                 feature_tracker.update_stability_error(zeros)
 
             total_loss.backward()
+
+            if gate_scale is not None:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(gate_scale)
 
             # update usage from grads
             usage_tracker.update_from_grads()
