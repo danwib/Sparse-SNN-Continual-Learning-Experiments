@@ -182,16 +182,16 @@ def _run_surrogate_warmup(
     controller: nn.Module | None,
     device: torch.device,
     lambda_stab: float,
-    cfg_dict: Dict[str, Any],
+    surrogate_cfg: StabilitySurrogateConfig | None,
     trainable_params: List[torch.Tensor],
 ) -> tuple[StabilitySurrogate | None, int]:
     """
     Collects descriptor/target pairs using the teacher model and fits the surrogate.
     Returns the trained surrogate and the number of batches consumed.
     """
-    surrogate_cfg = make_surrogate_config(cfg_dict)
     if (
-        not surrogate_cfg.enabled
+        surrogate_cfg is None
+        or not surrogate_cfg.enabled
         or surrogate_cfg.warmup_batches <= 0
         or stability_buffer is None
         or teacher_model is None
@@ -301,6 +301,7 @@ def train_single_task(
     stability_mode: str = "distillation",
     stability_surrogate: StabilitySurrogate | None = None,
     skip_initial_batches: int = 0,
+    surrogate_cfg: StabilitySurrogateConfig | None = None,
     trainable_params: List[torch.Tensor] | None = None,
 ) -> None:
 
@@ -353,6 +354,7 @@ def train_single_task(
             )
             surrogate_gate = None
             if use_surrogate_gate:
+                surrogate_batch_counter += 1
                 spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
                 batch_descriptor = build_surrogate_descriptor(
                     feature_matrix=feature_matrix.detach() if feature_matrix is not None else None,
@@ -369,8 +371,12 @@ def train_single_task(
                 with torch.no_grad():
                     surrogate_gate = stability_surrogate(batch_descriptor.unsqueeze(0)).squeeze(0).item()
                 surrogate_gate = float(max(0.0, min(1.0, surrogate_gate)))
-                drift_penalty = _teacher_weight_penalty(model, teacher_model)
-                stability_term = lambda_stab * (1.0 - surrogate_gate) * drift_penalty
+                interval = 1
+                if surrogate_cfg is not None and surrogate_cfg.drift_penalty_interval > 1:
+                    interval = surrogate_cfg.drift_penalty_interval
+                if surrogate_batch_counter % interval == 0:
+                    drift_penalty = _teacher_weight_penalty(model, teacher_model)
+                    stability_term = lambda_stab * (1.0 - surrogate_gate) * drift_penalty
 
             if not use_surrogate_gate:
                 if (
@@ -542,6 +548,9 @@ def train_task_sequence(
     stability_snapshot: Dict[str, torch.Tensor] | None = None
     stability_mode = cfg["train"].get("stability_mode", "distillation")
     surrogate_cfg_dict = cfg["train"].get("stability_surrogate")
+    surrogate_cfg = None
+    if surrogate_cfg_dict:
+        surrogate_cfg = make_surrogate_config(surrogate_cfg_dict)
 
     episode_metrics = {
         "pre_consolidation": [],
@@ -568,8 +577,8 @@ def train_task_sequence(
         if (
             stability_mode == "distillation"
             and lambda_stab > 0.0
-            and surrogate_cfg_dict is not None
-            and surrogate_cfg_dict.get("enabled", False)
+            and surrogate_cfg is not None
+            and surrogate_cfg.enabled
             and task_id > 0
         ):
             stability_surrogate, surrogate_skip = _run_surrogate_warmup(
@@ -581,7 +590,7 @@ def train_task_sequence(
                 controller=controller,
                 device=device,
                 lambda_stab=lambda_stab,
-                cfg_dict=surrogate_cfg_dict,
+                surrogate_cfg=surrogate_cfg,
                 trainable_params=trainable_params,
             )
 
@@ -608,6 +617,7 @@ def train_task_sequence(
             stability_mode=stability_mode,
             stability_surrogate=stability_surrogate,
             skip_initial_batches=surrogate_skip,
+            surrogate_cfg=surrogate_cfg,
             trainable_params=trainable_params,
         )
 

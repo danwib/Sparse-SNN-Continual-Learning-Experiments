@@ -44,3 +44,4 @@ train:
     enabled: false
     warmup_batches: 0
     gate_beta: 25.0
+    drift_penalty_interval: 1

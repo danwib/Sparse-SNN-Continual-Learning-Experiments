@@ -49,3 +49,4 @@ train:
     epochs: 200
     batch_size: null
     gate_beta: 25.0
+    drift_penalty_interval: 1

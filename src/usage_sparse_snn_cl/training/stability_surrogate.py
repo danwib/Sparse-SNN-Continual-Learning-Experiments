@@ -23,6 +23,7 @@ class StabilitySurrogateConfig:
     epochs: int = 200
     batch_size: Optional[int] = None
     gate_beta: float = 25.0
+    drift_penalty_interval: int = 1
 
 
 class StabilitySurrogate(nn.Module):
@@ -176,6 +177,7 @@ def make_surrogate_config(config_dict: Optional[Dict[str, Any]]) -> StabilitySur
         epochs=int(config_dict.get("epochs", 200)),
         batch_size=config_dict.get("batch_size"),
         gate_beta=float(config_dict.get("gate_beta", 25.0)),
+        drift_penalty_interval=int(config_dict.get("drift_penalty_interval", 1)),
     )
 
 

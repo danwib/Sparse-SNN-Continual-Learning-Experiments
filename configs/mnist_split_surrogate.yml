@@ -50,3 +50,4 @@ train:
     epochs: 300
     batch_size: 64
     gate_beta: 25.0
+    drift_penalty_interval: 10
