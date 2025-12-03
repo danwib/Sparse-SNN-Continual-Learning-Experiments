@@ -144,6 +144,45 @@ def controller_stability_penalty(
     return penalty / terms
 
 
+def _gradient_statistics(
+    loss: torch.Tensor,
+    params: List[torch.Tensor],
+) -> torch.Tensor | None:
+    grads = torch.autograd.grad(
+        loss,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+        create_graph=False,
+    )
+    flats: List[torch.Tensor] = []
+    for grad in grads:
+        if grad is not None:
+            flats.append(grad.reshape(-1))
+    if not flats:
+        return None
+    flat = torch.cat(flats)
+    mean_abs = flat.abs().mean()
+    max_abs = flat.abs().max()
+    l2_norm = torch.sqrt(torch.sum(flat.pow(2)))
+    return torch.stack([mean_abs, max_abs, l2_norm])
+
+
+def _teacher_weight_penalty(model: nn.Module, teacher_model: nn.Module) -> torch.Tensor:
+    penalty = 0.0
+    terms = 0
+    for p, t in zip(model.parameters(), teacher_model.parameters()):
+        if not p.requires_grad:
+            continue
+        diff = p - t.detach()
+        penalty = penalty + diff.pow(2).mean()
+        terms += 1
+    if terms == 0:
+        device = next(model.parameters()).device
+        return torch.zeros((), device=device)
+    return penalty / terms
+
+
 def _run_surrogate_warmup(
     model: nn.Module,
     train_loader: DataLoader,
@@ -154,6 +193,7 @@ def _run_surrogate_warmup(
     device: torch.device,
     lambda_stab: float,
     cfg_dict: Dict[str, Any],
+    trainable_params: List[torch.Tensor],
 ) -> tuple[StabilitySurrogate | None, int]:
     """
     Collects descriptor/target pairs using the teacher model and fits the surrogate.
@@ -202,6 +242,8 @@ def _run_surrogate_warmup(
             gates = g.detach()
             stability_control = s.detach()
 
+        grad_stats = _gradient_statistics(loss_task, trainable_params)
+
         descriptor = build_surrogate_descriptor(
             feature_matrix=feature_matrix,
             loss_task=loss_task.detach(),
@@ -212,6 +254,7 @@ def _run_surrogate_warmup(
             logits=logits.detach(),
             inputs=x.detach(),
             lambda_stab=lambda_stab,
+            grad_stats=grad_stats.detach() if grad_stats is not None else None,
         ).cpu()
         descriptors.append(descriptor)
 
@@ -261,10 +304,13 @@ def train_single_task(
     stability_mode: str = "distillation",
     stability_surrogate: StabilitySurrogate | None = None,
     skip_initial_batches: int = 0,
+    trainable_params: List[torch.Tensor] | None = None,
 ) -> None:
 
     model.train()
     ce = nn.CrossEntropyLoss()
+    if trainable_params is None:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     skipped_batches = 0
     for epoch in range(epochs):
@@ -298,15 +344,18 @@ def train_single_task(
             )
             if controller is not None and feature_matrix is not None:
                 gates_ctrl, stability_control = controller(feature_matrix)
+            grad_stats = None
 
             use_surrogate_gate = (
                 stability_mode == "distillation"
                 and is_acquisition
                 and lambda_stab > 0.0
                 and stability_surrogate is not None
+                and teacher_model is not None
             )
             surrogate_gate = None
             if use_surrogate_gate:
+                grad_stats = _gradient_statistics(loss_task, trainable_params)
                 spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
                 batch_descriptor = build_surrogate_descriptor(
                     feature_matrix=feature_matrix.detach() if feature_matrix is not None else None,
@@ -318,10 +367,13 @@ def train_single_task(
                     logits=logits.detach(),
                     inputs=x.detach(),
                     lambda_stab=lambda_stab,
+                    grad_stats=grad_stats.detach() if grad_stats is not None else None,
                 ).to(device)
                 with torch.no_grad():
                     surrogate_gate = stability_surrogate(batch_descriptor.unsqueeze(0)).squeeze(0).item()
                 surrogate_gate = float(max(0.0, min(1.0, surrogate_gate)))
+                drift_penalty = _teacher_weight_penalty(model, teacher_model)
+                stability_term = lambda_stab * (1.0 - surrogate_gate) * drift_penalty
 
             if not use_surrogate_gate:
                 if (
@@ -360,7 +412,7 @@ def train_single_task(
 
             gate_scale = None
             if surrogate_gate is not None:
-                gate_scale = 1.0 - lambda_stab * (1.0 - surrogate_gate)
+                gate_scale = surrogate_gate
 
             # Gradient-based feature updates (conflict / stability)
             if (
@@ -480,6 +532,8 @@ def train_task_sequence(
     replay_buffer = ReplayBuffer(cfg["train"]["replay_buffer_size"]) \
         if cfg["train"]["do_consolidation"] else None
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
     teacher_model = None
     stability_buffer = None
     stability_snapshot: Dict[str, torch.Tensor] | None = None
@@ -525,6 +579,7 @@ def train_task_sequence(
                 device=device,
                 lambda_stab=lambda_stab,
                 cfg_dict=surrogate_cfg_dict,
+                trainable_params=trainable_params,
             )
 
         if epochs_schedule is not None:
@@ -550,6 +605,7 @@ def train_task_sequence(
             stability_mode=stability_mode,
             stability_surrogate=stability_surrogate,
             skip_initial_batches=surrogate_skip,
+            trainable_params=trainable_params,
         )
 
         # eval on all tasks so far (simple CL metric)

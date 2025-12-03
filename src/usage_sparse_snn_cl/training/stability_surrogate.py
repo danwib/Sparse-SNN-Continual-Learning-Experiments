@@ -80,6 +80,7 @@ def build_surrogate_descriptor(
     logits: torch.Tensor,
     inputs: torch.Tensor,
     lambda_stab: float,
+    grad_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Assembles a compact descriptor vector from per-neuron summaries and
@@ -116,6 +117,8 @@ def build_surrogate_descriptor(
         device=device,
     )
     stats.extend([logits_stats, input_stats, scalars])
+    if grad_stats is not None:
+        stats.append(grad_stats.to(device))
     return torch.cat(stats).detach()
 
 
