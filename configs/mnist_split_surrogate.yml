@@ -23,6 +23,7 @@ train:
   lr: 0.001
   usage_decay: 0.99
   usage_alpha: 10.0
+  use_controller: false
 
   do_consolidation: true
   consolidation_epochs: 2

@@ -451,10 +451,14 @@ def train_task_sequence(
         )
     feature_tracker.to(device)
 
-    if controller is None:
+    use_controller = bool(cfg["train"].get("use_controller", True))
+    if not use_controller:
+        controller = None
+    elif controller is None:
         feature_dim = feature_tracker.get_feature_matrix().shape[1]
         controller = PerNeuronController(feature_dim=feature_dim)
-    controller.to(device)
+    if controller is not None:
+        controller.to(device)
 
     replay_buffer = ReplayBuffer(cfg["train"]["replay_buffer_size"]) \
         if cfg["train"]["do_consolidation"] else None
