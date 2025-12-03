@@ -1,0 +1,45 @@
+experiment_name: "mnist_split_meta_surrogate"
+
+seed: 1337
+device: "cpu"
+
+data:
+  root: "./data"
+  batch_size: 64
+  num_workers: 0
+  splits:
+    - [0, 1, 2, 3, 4]
+    - [5, 6, 7, 8, 9]
+
+model:
+  input_size: 784
+  hidden_size: 512
+  output_size: 10
+  time_steps: 5
+  v_th: 1.0
+
+train:
+  epochs_per_task: 2
+  lr: 0.001
+  usage_decay: 0.99
+  usage_alpha: 10.0
+
+  do_consolidation: false
+  consolidation_epochs: 0
+  replay_buffer_size: 2000
+
+  lambda_spike: 0.0005
+  lambda_weight: 0.00005
+  lambda_usage_weight: 10.0
+  prune_threshold: 0.0005
+  max_batches_per_epoch: 20
+  max_consolidation_batches: 0
+  truncate_window: 5
+  mid_eval_batches: [5, 10]
+
+  lambda_stab: 0.3
+  stability_mode: "distillation"
+  stability_buffer_size: 1000
+  stability_surrogate:
+    enabled: false
+    warmup_batches: 0

@@ -48,4 +48,11 @@ Overall, the combination of **sparsity, usage-aware gating, replay, and stabilit
   - Treat usage-based gating and stability strength as outer-loop parameters.
   - Eventually meta-learn a plasticity policy that decides *where* and *how strongly* to update the SNN to minimise forgetting while maximising continual performance.
 
+## Additional experiments
+
+- `configs/mnist_split_controller_stability.yml`: explores a controller-only stability penalty that removes the Task-1 teacher/stability buffer, letting per-neuron stability coefficients regularise weights directly.
+- `configs/mnist_split_surrogate.yml`: runs the full-sized Split-MNIST experiment with the surrogate-enabled stability path (`lambda_stab=0.5`, 128 warm-up batches).
+- `configs/mnist_split_meta_light.yml` / `configs/mnist_split_meta_surrogate.yml`: lightweight configs tailor-made for the `scripts/run_meta_and_full.py` workflow; they keep meta episodes cheap before running a full surrogate-enabled evaluation.
+- A surrogate stability controller can be enabled via the `stability_surrogate` block inside any `train` config. It briefly samples Task-2 batches before training, fits a small MLP to predict the teacher loss from controller/activation summaries, and then replaces the expensive teacher forward pass during Task-2 updates.
+
 This is all exploratory research code; expect rough edges and ongoing changes as the ideas evolve.

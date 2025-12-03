@@ -1,6 +1,6 @@
-experiment_name: "mnist_split_sparse_snn_full"
+experiment_name: "mnist_split_surrogate_distill"
 
-seed: 42
+seed: 123
 device: "cpu"
 
 data:
@@ -35,16 +35,16 @@ train:
   lambda_usage_weight: 10.0
   prune_threshold: 0.0005
   max_batches_per_epoch: null
-  max_consolidation_batches: null
   truncate_window: null
 
-  lambda_stab: 0.0
+  lambda_stab: 0.5
+  stability_mode: "distillation"
   stability_buffer_size: 2000
   stability_surrogate:
-    enabled: false
-    warmup_batches: 64
-    hidden_dim: 64
-    num_layers: 2
+    enabled: true
+    warmup_batches: 128
+    hidden_dim: 128
+    num_layers: 3
     lr: 0.001
-    epochs: 200
-    batch_size: null
+    epochs: 300
+    batch_size: 64

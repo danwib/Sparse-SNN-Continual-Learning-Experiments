@@ -87,7 +87,7 @@ def main():
     parser.add_argument("--controller-out", type=str, default="artifacts/controller_meta.pth")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--controller-lr", type=float, default=1e-3)
-    parser.add_argument("--full-num-workers", type=int, default=0)
+    parser.add_argument("--full-num-workers", type=int, default=None, help="Override num_workers during full run")
     args = parser.parse_args()
 
     meta_cfg_path = Path(args.meta_config)
@@ -116,7 +116,8 @@ def main():
     torch.save(controller.state_dict(), controller_out)
     print(f"[meta] controller saved to {controller_out}")
 
-    full_cfg_dict["data"]["num_workers"] = args.full_num_workers
+    if args.full_num_workers is not None:
+        full_cfg_dict["data"]["num_workers"] = args.full_num_workers
     run_full_training(full_cfg_dict, device, controller_out)
 
 

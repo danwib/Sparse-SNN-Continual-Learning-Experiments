@@ -10,6 +10,12 @@ from usage_sparse_snn_cl.training.replay_buffer import ReplayBuffer
 from usage_sparse_snn_cl.training.neuron_features import NeuronFeatureTracker, NeuronFeatureConfig
 from usage_sparse_snn_cl.training.controllers import PerNeuronController
 from usage_sparse_snn_cl.data.mnist_split import flatten_and_normalise
+from usage_sparse_snn_cl.training.stability_surrogate import (
+    StabilitySurrogate,
+    build_surrogate_descriptor,
+    make_surrogate_config,
+    train_stability_surrogate,
+)
 
 
 import copy
@@ -73,6 +79,164 @@ def _per_neuron_cosine_similarity(grad_a: torch.Tensor, grad_b: torch.Tensor) ->
     return dot / (norm_a * norm_b + eps)
 
 
+def clone_parameter_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Snapshot all trainable parameters; used for controller-only stability.
+    """
+    snapshot: Dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            snapshot[name] = param.detach().clone()
+    return snapshot
+
+
+def controller_stability_penalty(
+    model: nn.Module,
+    snapshot: Dict[str, torch.Tensor],
+    stability_control: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Penalise deviation from a previous task's parameters using controller-provided
+    per-neuron stability weights.
+    """
+    if not snapshot:
+        device = next(model.parameters()).device
+        return torch.zeros((), device=device)
+
+    hidden_linear: nn.Linear = model.hidden.linear
+    readout: nn.Linear = model.readout
+    device = hidden_linear.weight.device
+    if stability_control is None:
+        stability_control = torch.ones(hidden_linear.weight.size(0), device=device)
+    else:
+        stability_control = stability_control.to(device)
+
+    penalty = 0.0
+    terms = 0
+
+    prev_hidden_w = snapshot.get("hidden.linear.weight")
+    if prev_hidden_w is not None:
+        diff = hidden_linear.weight - prev_hidden_w.to(device)
+        penalty = penalty + (stability_control.unsqueeze(1) * diff.pow(2)).mean()
+        terms += 1
+
+    prev_hidden_b = snapshot.get("hidden.linear.bias")
+    if prev_hidden_b is not None:
+        diff = hidden_linear.bias - prev_hidden_b.to(device)
+        penalty = penalty + (stability_control * diff.pow(2)).mean()
+        terms += 1
+
+    prev_readout_w = snapshot.get("readout.weight")
+    if prev_readout_w is not None:
+        diff = readout.weight - prev_readout_w.to(device)
+        penalty = penalty + (stability_control.unsqueeze(0) * diff.pow(2)).mean()
+        terms += 1
+
+    prev_readout_b = snapshot.get("readout.bias")
+    if prev_readout_b is not None:
+        diff = readout.bias - prev_readout_b.to(device)
+        penalty = penalty + diff.pow(2).mean()
+        terms += 1
+
+    if terms == 0:
+        return torch.zeros((), device=device)
+    return penalty / terms
+
+
+def _run_surrogate_warmup(
+    model: nn.Module,
+    train_loader: DataLoader,
+    stability_buffer: ReplayBuffer | None,
+    teacher_model: nn.Module | None,
+    feature_tracker: NeuronFeatureTracker | None,
+    controller: nn.Module | None,
+    device: torch.device,
+    lambda_stab: float,
+    cfg_dict: Dict[str, Any],
+) -> tuple[StabilitySurrogate | None, int]:
+    """
+    Collects descriptor/target pairs using the teacher model and fits the surrogate.
+    Returns the trained surrogate and the number of batches consumed.
+    """
+    surrogate_cfg = make_surrogate_config(cfg_dict)
+    if (
+        not surrogate_cfg.enabled
+        or surrogate_cfg.warmup_batches <= 0
+        or stability_buffer is None
+        or teacher_model is None
+    ):
+        return None, 0
+
+    ce = nn.CrossEntropyLoss()
+    descriptors: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    loader_iter = iter(train_loader)
+    batches = 0
+
+    print(
+        f"  [surrogate] collecting {surrogate_cfg.warmup_batches} Task-2 batches for warm-up..."
+    )
+    while batches < surrogate_cfg.warmup_batches:
+        try:
+            x, y = next(loader_iter)
+        except StopIteration:
+            break
+        batches += 1
+        x = flatten_and_normalise(x).to(device)
+        y = y.to(device)
+
+        logits, aux = model(x)
+        loss_task = ce(logits, y)
+        batch_acc = accuracy(logits, y)
+        feature_matrix = (
+            feature_tracker.get_feature_matrix().detach()
+            if feature_tracker is not None
+            else None
+        )
+        spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
+        gates = None
+        stability_control = None
+        if controller is not None and feature_matrix is not None:
+            g, s = controller(feature_matrix)
+            gates = g.detach()
+            stability_control = s.detach()
+
+        descriptor = build_surrogate_descriptor(
+            feature_matrix=feature_matrix,
+            loss_task=loss_task.detach(),
+            batch_acc=batch_acc,
+            spike_batch=spike_batch.detach() if spike_batch is not None else None,
+            gates=gates,
+            stability_control=stability_control,
+            logits=logits.detach(),
+            inputs=x.detach(),
+            lambda_stab=lambda_stab,
+        ).cpu()
+        descriptors.append(descriptor)
+
+        x_old, _ = stability_buffer.sample(train_loader.batch_size)
+        x_old = x_old.to(device)
+        with torch.no_grad():
+            teacher_logits, _ = teacher_model(x_old)
+        student_logits, _ = model(x_old)
+        stab_loss = F.mse_loss(student_logits, teacher_logits).detach().cpu()
+        targets.append(stab_loss)
+
+    if not descriptors:
+        print("  [surrogate] insufficient data for warm-up; skipping surrogate training.")
+        return None, 0
+
+    desc_tensor = torch.stack(descriptors)
+    target_tensor = torch.stack(targets)
+    surrogate, losses = train_stability_surrogate(desc_tensor, target_tensor, surrogate_cfg, device)
+    final_loss = losses[-1] if losses else 0.0
+    print(
+        f"  [surrogate] trained on {len(descriptors)} samples "
+        f"(final surrogate loss={final_loss:.6f})"
+    )
+    return surrogate, len(descriptors)
+
+
 def train_single_task(
     model: nn.Module,
     optimizer: optim.Optimizer,
@@ -91,13 +255,21 @@ def train_single_task(
     stability_buffer: ReplayBuffer | None = None,
     teacher_model: nn.Module | None = None,
     lambda_stab: float = 0.0,
+    stability_snapshot: Dict[str, torch.Tensor] | None = None,
+    stability_mode: str = "distillation",
+    stability_surrogate: StabilitySurrogate | None = None,
+    skip_initial_batches: int = 0,
 ) -> None:
 
     model.train()
     ce = nn.CrossEntropyLoss()
 
+    skipped_batches = 0
     for epoch in range(epochs):
         for x, y in train_loader:
+            if skip_initial_batches > 0 and skipped_batches < skip_initial_batches:
+                skipped_batches += 1
+                continue
             x = flatten_and_normalise(x).to(device)
             y = y.to(device)
 
@@ -119,27 +291,63 @@ def train_single_task(
             stab_loss = None
             stability_control = None
             # Stability / distillation loss on previous tasks (Design 1)
+            if controller is not None and feature_tracker is not None:
+                feature_matrix = feature_tracker.get_feature_matrix()
+            else:
+                feature_matrix = None
+
             if (
-                is_acquisition
-                and stability_buffer is not None
-                and teacher_model is not None
+                stability_mode == "distillation"
+                and is_acquisition
                 and lambda_stab > 0.0
             ):
-                # Sample a batch of Task-1 inputs
-                x_old, _ = stability_buffer.sample(train_loader.batch_size)
-                x_old = x_old.to(device)
-
-                with torch.no_grad():
-                    teacher_logits, _ = teacher_model(x_old)
-
-                student_logits, _ = model(x_old)
-                if controller is not None and feature_tracker is not None:
-                    _, stability_control = controller(feature_tracker.get_feature_matrix())
+                stab_scale = 1.0
+                stability_control = None
+                if controller is not None and feature_matrix is not None:
+                    _, stability_control = controller(feature_matrix)
                     stab_scale = stability_control.mean()
-                else:
-                    stab_scale = 1.0
-                stab_loss = F.mse_loss(student_logits, teacher_logits)
-                stability_term = lambda_stab * stab_scale * stab_loss
+
+                if stability_surrogate is not None:
+                    spike_batch = aux.get("hidden_spike_rate") if isinstance(aux, dict) else None
+                    batch_descriptor = build_surrogate_descriptor(
+                        feature_matrix=feature_matrix.detach() if feature_matrix is not None else None,
+                        loss_task=loss_task.detach(),
+                        batch_acc=accuracy(logits, y),
+                        spike_batch=spike_batch.detach() if spike_batch is not None else None,
+                        gates=None,
+                        stability_control=stability_control.detach() if stability_control is not None else None,
+                        logits=logits.detach(),
+                        inputs=x.detach(),
+                        lambda_stab=lambda_stab,
+                    ).to(device)
+                    with torch.no_grad():
+                        stab_loss = stability_surrogate(batch_descriptor.unsqueeze(0)).squeeze(0)
+                    stability_term = lambda_stab * stab_scale * stab_loss
+                elif (
+                    stability_buffer is not None
+                    and teacher_model is not None
+                ):
+                    # Sample a batch of Task-1 inputs
+                    x_old, _ = stability_buffer.sample(train_loader.batch_size)
+                    x_old = x_old.to(device)
+
+                    with torch.no_grad():
+                        teacher_logits, _ = teacher_model(x_old)
+
+                    student_logits, _ = model(x_old)
+                    stab_loss = F.mse_loss(student_logits, teacher_logits)
+                    stability_term = lambda_stab * stab_scale * stab_loss
+            elif (
+                stability_mode == "controller_reg"
+                and is_acquisition
+                and stability_snapshot is not None
+                and lambda_stab > 0.0
+            ):
+                if controller is not None and feature_matrix is not None:
+                    _, stability_control = controller(feature_matrix)
+                stability_term = lambda_stab * controller_stability_penalty(
+                    model, stability_snapshot, stability_control
+                )
 
             total_loss = loss_task
             if stability_term is not None:
@@ -256,6 +464,9 @@ def train_task_sequence(
 
     teacher_model = None
     stability_buffer = None
+    stability_snapshot: Dict[str, torch.Tensor] | None = None
+    stability_mode = cfg["train"].get("stability_mode", "distillation")
+    surrogate_cfg_dict = cfg["train"].get("stability_surrogate")
 
     episode_metrics = {
         "pre_consolidation": [],
@@ -277,6 +488,27 @@ def train_task_sequence(
         # For Task 2+: they are set → Design 1 distillation is active.
         lambda_stab = float(cfg["train"].get("lambda_stab", 0.0))
 
+        stability_surrogate = None
+        surrogate_skip = 0
+        if (
+            stability_mode == "distillation"
+            and lambda_stab > 0.0
+            and surrogate_cfg_dict is not None
+            and surrogate_cfg_dict.get("enabled", False)
+            and task_id > 0
+        ):
+            stability_surrogate, surrogate_skip = _run_surrogate_warmup(
+                model=model,
+                train_loader=train_loader,
+                stability_buffer=stability_buffer,
+                teacher_model=teacher_model,
+                feature_tracker=feature_tracker,
+                controller=controller,
+                device=device,
+                lambda_stab=lambda_stab,
+                cfg_dict=surrogate_cfg_dict,
+            )
+
         if epochs_schedule is not None:
             epochs = epochs_schedule[task_id] if task_id < len(epochs_schedule) else epochs_schedule[-1]
         else:
@@ -296,6 +528,10 @@ def train_task_sequence(
             stability_buffer=stability_buffer,
             teacher_model=teacher_model,
             lambda_stab=lambda_stab,
+            stability_snapshot=stability_snapshot,
+            stability_mode=stability_mode,
+            stability_surrogate=stability_surrogate,
+            skip_initial_batches=surrogate_skip,
         )
 
         # eval on all tasks so far (simple CL metric)
@@ -420,8 +656,8 @@ def train_task_sequence(
             f"usage_max={usage_stats['usage_max']:.5f}"
         )
 
-        # 5) After Task 1, snapshot a teacher + build stability buffer for Task 1
-        if task_id == 0:
+        # 5) Build stability references for future tasks
+        if stability_mode == "distillation" and task_id == 0:
             print("  creating teacher snapshot and stability buffer for Task 1...")
             # Teacher: deep copy of current model, frozen
             teacher_model = copy.deepcopy(model).to(device)
@@ -438,5 +674,7 @@ def train_task_sequence(
                 x_flat = flatten_and_normalise(x_batch)
                 stability_buffer.add_batch(x_flat, y_batch)
             print(f"  stability buffer filled with {len(stability_buffer)} Task-1 batches")
+        elif stability_mode == "controller_reg":
+            stability_snapshot = clone_parameter_dict(model)
 
     return episode_metrics
