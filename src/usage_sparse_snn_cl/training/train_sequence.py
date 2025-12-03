@@ -291,12 +291,12 @@ def train_single_task(
             stab_loss = None
             stability_control = None
             gates_ctrl = None
-            # Stability / distillation loss on previous tasks (Design 1)
-            if controller is not None and feature_tracker is not None:
-                feature_matrix = feature_tracker.get_feature_matrix()
+            # Always fetch the feature matrix if available so descriptors stay consistent.
+            feature_matrix = (
+                feature_tracker.get_feature_matrix() if feature_tracker is not None else None
+            )
+            if controller is not None and feature_matrix is not None:
                 gates_ctrl, stability_control = controller(feature_matrix)
-            else:
-                feature_matrix = None
 
             if (
                 stability_mode == "distillation"
